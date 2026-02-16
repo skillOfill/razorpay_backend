@@ -108,7 +108,7 @@ def create_payment_link():
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
 
-    amount = int(os.environ.get("PAYMENT_AMOUNT_PAISE", "49900"))  # ₹499
+    amount = int(os.environ.get("PAYMENT_AMOUNT_PAISE", "100"))  # ₹1
     currency = os.environ.get("PAYMENT_CURRENCY", "INR")
     description = os.environ.get("PAYMENT_DESCRIPTION", "SQL Humanizer Pro — Unlimited translations")
 
@@ -167,3 +167,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
