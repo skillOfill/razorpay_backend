@@ -10,7 +10,7 @@ from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 load_dotenv()
 
-from db import add_key, is_valid_key, get_key_by_order
+from db import add_key, is_valid_key, get_key_by_order, email_has_license
 from mailer import send_license_email
 
 app = Flask(__name__)
@@ -84,6 +84,52 @@ def validate_key():
     if not key:
         return jsonify({"valid": False}), 400
     return jsonify({"valid": is_valid_key(key)}), 200
+
+
+@app.route("/api/validate-by-email", methods=["GET"])
+def validate_by_email():
+    """Streamlit app calls this for auto-unlock: has this email (e.g. Google) paid?"""
+    email = (request.args.get("email") or "").strip()
+    if not email:
+        return jsonify({"valid": False}), 400
+    return jsonify({"valid": email_has_license(email)}), 200
+
+
+@app.route("/api/create-payment-link", methods=["POST"])
+def create_payment_link():
+    """Create a Razorpay payment link with customer email (for Google Login → Payment flow)."""
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return jsonify({"error": "Razorpay not configured"}), 503
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({"error": "Invalid JSON"}), 400
+    email = (data.get("email") or "").strip()
+    if not email or "@" not in email:
+        return jsonify({"error": "Valid email required"}), 400
+
+    amount = int(os.environ.get("PAYMENT_AMOUNT_PAISE", "49900"))  # ₹499
+    currency = os.environ.get("PAYMENT_CURRENCY", "INR")
+    description = os.environ.get("PAYMENT_DESCRIPTION", "SQL Humanizer Pro — Unlimited translations")
+
+    try:
+        import razorpay
+        client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        payload = {
+            "amount": amount,
+            "currency": currency,
+            "description": description,
+            "customer": {"email": email},
+            "notify": {"sms": False, "email": True},
+        }
+        result = client.payment_link.create(payload)
+        short_url = (result or {}).get("short_url") or ""
+        if not short_url:
+            return jsonify({"error": "No payment URL returned"}), 502
+        return jsonify({"url": short_url}), 200
+    except Exception as e:
+        logger.exception("Create payment link failed: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/thank-you", methods=["GET"])
