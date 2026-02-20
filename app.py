@@ -54,18 +54,56 @@ def razorpay_webhook():
         return jsonify({"ok": False, "error": "Invalid JSON"}), 400
 
     event = data.get("event")
+    payload = data.get("payload", {})
+
+    # payment_link.paid: payment link was created with customer.email (checkout doesn't ask for it).
+    if event == "payment_link.paid":
+        plink = payload.get("payment_link", {})
+        pl_entity = plink.get("entity", plink) if isinstance(plink, dict) else {}
+        customer = (pl_entity.get("customer") or {}) if isinstance(pl_entity, dict) else {}
+        email = (customer.get("email") or "").strip() if isinstance(customer, dict) else ""
+        order_id = (pl_entity.get("reference_id") or "") if isinstance(pl_entity, dict) else ""
+        payment_id = ""
+        payments = pl_entity.get("payments") if isinstance(pl_entity, dict) else None
+        if payments and isinstance(payments, list) and payments:
+            first = payments[0]
+            payment_id = (first.get("id") or "") if isinstance(first, dict) else (getattr(first, "id", None) or "")
+        if not email:
+            logger.warning("payment_link.paid missing email: %s", data)
+            return jsonify({"ok": False, "error": "Missing email in payment_link.paid"}), 400
+        license_key = generate_license_key()
+        add_key(license_key=license_key, email=email, order_id=order_id, payment_id=payment_id)
+        sent = send_license_email(to_email=email, license_key=license_key)
+        logger.info("License created (payment_link.paid) for %s key=%s email_sent=%s", email, license_key[:12] + "...", sent)
+        return jsonify({"ok": True, "license_key": license_key, "email_sent": sent}), 200
+
     if event != "payment.captured":
         return jsonify({"ok": True, "message": "Event ignored"}), 200
 
-    payload = data.get("payload", {})
     payment = payload.get("payment", {})
     entity = payment.get("entity", payment)
     email = (entity.get("email") or "").strip()
     order_id = entity.get("order_id") or ""
     payment_id = entity.get("id") or ""
 
+    # Razorpay payment page often doesn't ask for email; payload can be empty. Fetch from API:
+    # payment link was created with customer.email (your Google email), so fetched payment may have it.
+    if not email and payment_id and RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+        try:
+            import razorpay
+            client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+            fetched = client.payment.fetch(payment_id)
+            if isinstance(fetched, dict):
+                email = (fetched.get("email") or "").strip()
+            else:
+                email = (getattr(fetched, "email", None) or "").strip()
+            if email:
+                logger.info("Got email from Razorpay payment fetch: %s", email)
+        except Exception as e:
+            logger.warning("Could not fetch payment for email fallback: %s", e)
+
     if not email:
-        logger.warning("payment.captured missing email: %s", data)
+        logger.warning("payment.captured missing email (payload and fetch): %s", data)
         return jsonify({"ok": False, "error": "Missing email"}), 400
 
     license_key = generate_license_key()
@@ -92,7 +130,11 @@ def validate_by_email():
     email = (request.args.get("email") or "").strip()
     if not email:
         return jsonify({"valid": False}), 400
-    return jsonify({"valid": email_has_license(email)}), 200
+    valid = email_has_license(email)
+    # Optional: ?debug=1 returns the email we checked (to verify Streamlit sends same email you paid with)
+    if request.args.get("debug") == "1":
+        return jsonify({"valid": valid, "checked_email": email}), 200
+    return jsonify({"valid": valid}), 200
 
 
 @app.route("/api/create-payment-link", methods=["POST"])
@@ -108,9 +150,12 @@ def create_payment_link():
     if not email or "@" not in email:
         return jsonify({"error": "Valid email required"}), 400
 
-    amount = int(os.environ.get("PAYMENT_AMOUNT_PAISE", "100"))  # ₹1
+    amount = int(os.environ.get("PAYMENT_AMOUNT_PAISE", "49900"))  # ₹499
     currency = os.environ.get("PAYMENT_CURRENCY", "INR")
     description = os.environ.get("PAYMENT_DESCRIPTION", "SQL Humanizer Pro — Unlimited translations")
+    # So after payment Razorpay redirects here (avoids 404 on random redirect URL)
+    callback_base = os.environ.get("CALLBACK_BASE_URL", "").strip().rstrip("/")
+    callback_url = f"{callback_base}/thank-you" if callback_base else None
 
     try:
         import razorpay
@@ -122,6 +167,9 @@ def create_payment_link():
             "customer": {"email": email},
             "notify": {"sms": False, "email": True},
         }
+        if callback_url:
+            payload["callback_url"] = callback_url
+            payload["callback_method"] = "get"
         result = client.payment_link.create(payload)
         short_url = (result or {}).get("short_url") or ""
         if not short_url:
@@ -159,12 +207,27 @@ def thank_you():
     """
 
 
+@app.route("/success", methods=["GET"])
+@app.route("/callback", methods=["GET"])
+def payment_success_redirect():
+    """Common names for post-payment redirect; avoid 404 if Razorpay or dashboard points here."""
+    return thank_you()
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "SQL Humanizer License Server",
+        "health": "/health",
+        "docs": "Webhook: POST /webhook/razorpay. Validate: GET /api/validate-by-email?email=...",
+    }), 200
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
-
